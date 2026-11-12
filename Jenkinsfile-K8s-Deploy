@@ -1,65 +1,129 @@
+
 pipeline {
     agent any
-        environment {
-        //once you sign up for Docker hub, use that user_id here
-        registry = "ananthkannan/mypython-app-may20"
-        //- update your credentials ID after creating credentials for connecting to Docker Hub
-        registryCredential = 'dockerhub'
-        dockerImage = ''
+
+    environment {
+        AWS_REGION = 'us-east-1'
+        AWS_ACCOUNT_ID = '259151461867'
+        ECR_REPOSITORY = 'springboot-app'
+        EKS_CLUSTER = 'demo-eks'
+        K8S_NAMESPACE = 'helm-deployment'
+        HELM_RELEASE = 'first'
+        ECR_URI = '259151461867.dkr.ecr.us-east-1.amazonaws.com'
     }
+
     stages {
 
-        stage ('checkout') {
+        stage('GitHub Checkout') {
             steps {
-            checkout([$class: 'GitSCM', branches: [[name: '*/master']], doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [], userRemoteConfigs: [[url: 'https://github.com/akannan1087/myPythonDockerRepo']]])
+                git branch: 'main',
+                    url: 'https://github.com/akannan1087/springboot-app.git'
             }
         }
-       
-        stage ('Build docker image') {
-            steps {
-                script {
-                dockerImage = docker.build registry + ":$BUILD_NUMBER"
-                //dockerImage = docker.build registry + ":$BUILD_NUMBER"
 
+        stage('Maven Build') {
+            steps {
+                sh '''
+                    echo "Building Spring Boot application..."
+                    mvn clean package -DskipTests
+                    test -f target/springbootApp.jar
+                    echo "Maven Build Successful!"
+                '''
+            }
+        }
+
+        stage('Docker Build') {
+            steps {
+                sh '''
+                    echo "Building Docker Image..."
+                    docker build -t springboot-app:${BUILD_NUMBER} .
+                '''
+            }
+        }
+
+        stage('Push Image to AWS ECR') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo "Logging into AWS ECR..."
+
+                    aws ecr get-login-password --region ${AWS_REGION} |
+                    docker login --username AWS --password-stdin ${ECR_URI}
+
+                    echo "Tagging Docker Image..."
+
+                    docker tag springboot-app:${BUILD_NUMBER} \
+                    ${ECR_URI}/${ECR_REPOSITORY}:${BUILD_NUMBER}
+
+                    echo "Pushing Image to ECR..."
+
+                    docker push ${ECR_URI}/${ECR_REPOSITORY}:${BUILD_NUMBER}
+                '''
+            }
+        }
+
+        stage('Configure EKS') {
+            steps {
+                sh '''
+                    echo "Connecting to EKS Cluster..."
+
+                    aws eks update-kubeconfig \
+                    --region ${AWS_REGION} \
+                    --name ${EKS_CLUSTER}
+
+                    kubectl get nodes
+                '''
+            }
+        }
+
+        stage('Deploy using Helm') {
+            steps {
+                withEnv(["PATH+HELM=/var/lib/jenkins/bin"]) {
+                    sh '''
+                        echo "Deploying application using Helm..."
+
+                        helm upgrade --install ${HELM_RELEASE} ./mychart \
+                            --namespace ${K8S_NAMESPACE} \
+                            --set image.repository=${ECR_URI}/${ECR_REPOSITORY} \
+                            --set image.tag=${BUILD_NUMBER} \
+                            --set image.pullPolicy=Always
+
+                        kubectl rollout status deployment/first-mychart \
+                            -n ${K8S_NAMESPACE} \
+                            --timeout=180s
+                    '''
                 }
             }
         }
-       
-         // Uploading Docker images into Docker Hub
-    stage('Upload Image') {
-     steps{   
-         script {
-            docker.withRegistry( '', registryCredential ) {
-            dockerImage.push()
-            }
-        }
-      }
-    }
 
-    stage('Remove Unused docker image') {
-      steps{
-        sh "docker rmi $registry:$BUILD_NUMBER"
-      }
-    }
-   
-    stage ('K8S Deploy') {
-        steps {
-            script {
-                kubernetesDeploy(
-                    configs: 'k8s-deployment.yaml',
-                    kubeconfigId: 'K8S',
-                    enableConfigSubstitution: true
-                    )           
-               
+        stage('Verify Deployment') {
+            steps {
+                sh '''
+                    echo "Checking Kubernetes Pods..."
+                    kubectl get pods -n ${K8S_NAMESPACE}
+
+                    echo "Checking Kubernetes Service..."
+                    kubectl get svc -n ${K8S_NAMESPACE}
+
+                    echo "Checking Deployment..."
+                    kubectl get deployment -n ${K8S_NAMESPACE}
+                '''
             }
         }
     }
-  
-    }  
-}
 
-always {
-  // remove built docker image and prune system
-  print 'Cleaning up the Docker system.'
-  sh 'docker system prune -f'
+    post {
+        success {
+            echo 'SUCCESS: Lab 42 Jenkins CI/CD Pipeline completed!'
+        }
+
+        failure {
+            echo 'FAILED: Check Jenkins Console Output.'
+        }
+
+        always {
+            echo 'Pipeline execution finished.'
+        }
+    }
 }
